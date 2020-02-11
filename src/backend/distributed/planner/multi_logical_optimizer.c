@@ -32,6 +32,7 @@
 #include "distributed/function_utils.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/query_pushdown_planning.h"
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
@@ -1568,29 +1569,34 @@ MasterAggregateExpression(Aggref *originalAggregate,
 	const AttrNumber argumentId = 1; /* our aggregates have single arguments */
 	AggregateType aggregateType = GetAggregateType(originalAggregate);
 	Expr *newMasterExpression = NULL;
-	AggClauseCosts aggregateCosts;
 
 	if (walkerContext->extendedOpNodeProperties->pullUpIntermediateRows)
 	{
+		/* SubLinks are recursively planned. They are not pushed down. */
+
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 
-		TargetEntry *targetEntry;
+		TargetEntry *targetEntry = NULL;
 		foreach_ptr(targetEntry, aggregate->args)
 		{
-			targetEntry->expr = (Expr *)
-								makeVar(masterTableId, walkerContext->columnId,
-										exprType((Node *) targetEntry->expr),
-										exprTypmod((Node *) targetEntry->expr),
-										exprCollation((Node *) targetEntry->expr),
-										columnLevelsUp);
-			walkerContext->columnId++;
+			if (!IsA(targetEntry->expr, SubLink))
+			{
+				targetEntry->expr = (Expr *)
+									makeVar(masterTableId, walkerContext->columnId,
+											exprType((Node *) targetEntry->expr),
+											exprTypmod((Node *) targetEntry->expr),
+											exprCollation((Node *) targetEntry->expr),
+											columnLevelsUp);
+				walkerContext->columnId++;
+			}
 		}
 
 		aggregate->aggdirectargs = NIL;
-		Expr *directarg;
+		Expr *directarg = NULL;
 		foreach_ptr(directarg, originalAggregate->aggdirectargs)
 		{
-			if (!IsA(directarg, Const) && !IsA(directarg, Param))
+			if (!IsA(directarg, Const) && !IsA(directarg, Param) &&
+				!IsA(directarg, SubLink))
 			{
 				Var *var = makeVar(masterTableId, walkerContext->columnId,
 								   exprType((Node *) directarg),
@@ -1606,7 +1612,7 @@ MasterAggregateExpression(Aggref *originalAggregate,
 			}
 		}
 
-		if (aggregate->aggfilter)
+		if (aggregate->aggfilter && !IsA(aggregate->aggfilter, SubLink))
 		{
 			aggregate->aggfilter = (Expr *)
 								   makeVar(masterTableId, walkerContext->columnId,
@@ -1995,6 +2001,10 @@ MasterAggregateExpression(Aggref *originalAggregate,
 			elog(ERROR, "Aggregate lacks COMBINEFUNC");
 		}
 	}
+	else if (aggregateType == AGGREGATE_CUSTOM_NO_PUSHDOWN)
+	{
+		return (Expr *) originalAggregate;
+	}
 	else
 	{
 		/*
@@ -2051,12 +2061,6 @@ MasterAggregateExpression(Aggref *originalAggregate,
 	{
 		newMasterExpression = typeConvertedExpression;
 	}
-
-	/* Run AggRefs through cost machinery to mark required fields sanely */
-	memset(&aggregateCosts, 0, sizeof(aggregateCosts));
-
-	get_agg_clause_costs(NULL, (Node *) newMasterExpression, AGGSPLIT_SIMPLE,
-						 &aggregateCosts);
 
 	return newMasterExpression;
 }
@@ -2909,22 +2913,28 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 
 	if (walkerContext->extendedOpNodeProperties->pullUpIntermediateRows)
 	{
-		TargetEntry *targetEntry;
+		/* SubLinks are recursively planned. Do not push these down. */
+
+		TargetEntry *targetEntry = NULL;
 		foreach_ptr(targetEntry, originalAggregate->args)
 		{
-			workerAggregateList = lappend(workerAggregateList, targetEntry->expr);
+			if (!IsA(targetEntry->expr, SubLink))
+			{
+				workerAggregateList = lappend(workerAggregateList, targetEntry->expr);
+			}
 		}
 
-		Expr *directarg;
+		Expr *directarg = NULL;
 		foreach_ptr(directarg, originalAggregate->aggdirectargs)
 		{
-			if (!IsA(directarg, Const) && !IsA(directarg, Param))
+			if (!IsA(directarg, Const) && !IsA(directarg, Param) &&
+				!IsA(directarg, SubLink))
 			{
 				workerAggregateList = lappend(workerAggregateList, directarg);
 			}
 		}
 
-		if (originalAggregate->aggfilter)
+		if (originalAggregate->aggfilter && !IsA(originalAggregate->aggfilter, SubLink))
 		{
 			workerAggregateList = lappend(workerAggregateList,
 										  originalAggregate->aggfilter);
@@ -2934,7 +2944,6 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 	}
 
 	AggregateType aggregateType = GetAggregateType(originalAggregate);
-	AggClauseCosts aggregateCosts;
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
@@ -3103,6 +3112,10 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 			elog(ERROR, "Aggregate lacks COMBINEFUNC");
 		}
 	}
+	else if (aggregateType == AGGREGATE_CUSTOM_NO_PUSHDOWN)
+	{
+		return NIL;
+	}
 	else
 	{
 		/*
@@ -3111,13 +3124,6 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 		Aggref *workerAggregate = copyObject(originalAggregate);
 		workerAggregateList = lappend(workerAggregateList, workerAggregate);
 	}
-
-
-	/* Run AggRefs through cost machinery to mark required fields sanely */
-	memset(&aggregateCosts, 0, sizeof(aggregateCosts));
-
-	get_agg_clause_costs(NULL, (Node *) workerAggregateList, AGGSPLIT_SIMPLE,
-						 &aggregateCosts);
 
 	return workerAggregateList;
 }
@@ -3131,6 +3137,56 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 static AggregateType
 GetAggregateType(Aggref *aggregateExpression)
 {
+	/*
+	 * if all arguments are sublinks then no push down is required,
+	 * as these are intermediate results. If only some arguments are
+	 * sublinks we'll want to use row-gather because it can handle
+	 * not pushing down those arguments.
+	 */
+	bool hasNonSublinkArgument = false;
+	bool hasSublinkArgument = false;
+	TargetEntry *targetEntry = NULL;
+	foreach_ptr(targetEntry, aggregateExpression->args)
+	{
+		if (IsA(targetEntry->expr, SubLink))
+		{
+			hasSublinkArgument = true;
+		}
+		else
+		{
+			hasNonSublinkArgument = true;
+		}
+	}
+	Expr *directarg = NULL;
+	foreach_ptr(directarg, aggregateExpression->aggdirectargs)
+	{
+		if (IsA(directarg, SubLink))
+		{
+			hasSublinkArgument = true;
+		}
+		else
+		{
+			hasNonSublinkArgument = true;
+		}
+	}
+	if (aggregateExpression->aggfilter != NULL)
+	{
+		if (IsA(aggregateExpression->aggfilter, SubLink))
+		{
+			hasSublinkArgument = true;
+		}
+		else
+		{
+			hasNonSublinkArgument = true;
+		}
+	}
+
+	if (hasSublinkArgument)
+	{
+		return hasNonSublinkArgument ? AGGREGATE_CUSTOM_ROW_GATHER :
+			   AGGREGATE_CUSTOM_NO_PUSHDOWN;
+	}
+
 	Oid aggFunctionId = aggregateExpression->aggfnoid;
 
 	/* look up the function name */
@@ -3677,7 +3733,8 @@ DeferErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 	AggregateType aggregateType = GetAggregateType(aggregateExpression);
 
 	/* If we're aggregating on coordinator, this becomes simple. */
-	if (aggregateType == AGGREGATE_CUSTOM_ROW_GATHER)
+	if (aggregateType == AGGREGATE_CUSTOM_ROW_GATHER ||
+		aggregateType == AGGREGATE_CUSTOM_NO_PUSHDOWN)
 	{
 		return NULL;
 	}
