@@ -160,6 +160,8 @@ struct CopyPlacementState
 	/* State of shard to which the placement belongs to. */
 	CopyShardState *shardState;
 
+	int32 groupId;
+
 	/*
 	 * Buffered COPY data. When the placement is activePlacementState of
 	 * some connection, this is empty. Because in that case we directly
@@ -1018,7 +1020,10 @@ SendCopyDataToAll(StringInfo dataBuffer, int64 shardId, List *connectionList)
 static void
 SendCopyDataToPlacement(StringInfo dataBuffer, int64 shardId, MultiConnection *connection)
 {
-	if (!PutRemoteCopyData(connection, dataBuffer->data, dataBuffer->len))
+	if (shardId == GetLocalGroupId()) {
+
+	}
+	else if (!PutRemoteCopyData(connection, dataBuffer->data, dataBuffer->len))
 	{
 		ereport(ERROR, (errcode(ERRCODE_IO_ERROR),
 						errmsg("failed to COPY to shard " INT64_FORMAT " on %s:%d",
@@ -2063,6 +2068,19 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 		bool switchToCurrentPlacement = false;
 		bool sendTupleOverConnection = false;
 
+		if (currentPlacementState->groupId == GetLocalGroupId()) {
+			CopyStmt* copyStatement = copyDest->copyStatement;
+			Oid relationId = copyDest->distributedRelationId;
+			ParseState *pstate = make_parsestate(NULL);
+			
+			Relation rel = relation_open(relationId, ExclusiveLock);
+
+			CopyState cstate = BeginCopyFrom(pstate, rel, NULL, NULL,
+						NULL, copyStatement->attlist, copyStatement->options);
+			CopyFrom(cstate);
+			EndCopyFrom(cstate);
+			continue;
+		}
 		if (activePlacementState == NULL)
 		{
 			switchToCurrentPlacement = true;
@@ -2081,7 +2099,8 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 		if (switchToCurrentPlacement)
 		{
 			StartPlacementStateCopyCommand(currentPlacementState, copyStatement,
-										   copyOutState);
+								copyOutState);
+
 			dlist_delete(&currentPlacementState->bufferedPlacementNode);
 			connectionState->activePlacementState = currentPlacementState;
 
@@ -2789,7 +2808,6 @@ InitializeCopyShardState(CopyShardState *shardState,
 	foreach(placementCell, activePlacementList)
 	{
 		ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
-
 		MultiConnection *connection =
 			CopyGetPlacementConnection(placement, stopOnFailure);
 		if (connection == NULL)
@@ -2813,6 +2831,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 		CopyPlacementState *placementState = palloc0(sizeof(CopyPlacementState));
 		placementState->shardState = shardState;
 		placementState->data = makeStringInfo();
+		placementState->groupId = placement->groupId;
 		placementState->connectionState = connectionState;
 
 		/*
