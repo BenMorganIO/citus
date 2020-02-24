@@ -298,20 +298,17 @@ GenerateAlterRoleSetIfExistsCommandList(HeapTuple tuple, TupleDesc
 
 	for (i = 1; i <= ARR_DIMS(array)[0]; i++)
 	{
-		Datum d;
-		char *configItem;
-
-		d = array_ref(array, 1, &i,
-					  -1 /* varlenarray */,
-					  -1 /* TEXT's typlen */,
-					  false /* TEXT's typbyval */,
-					  'i' /* TEXT's typalign */,
-					  &isnull);
+		Datum d = array_ref(array, 1, &i,
+							-1 /* varlenarray */,
+							-1 /* TEXT's typlen */,
+							false /* TEXT's typbyval */,
+							'i' /* TEXT's typalign */,
+							&isnull);
 		if (isnull)
 		{
 			continue;
 		}
-		configItem = TextDatumGetCString(d);
+		char *configItem = TextDatumGetCString(d);
 
 		char *pos = strchr(configItem, '=');
 		if (pos == NULL)
