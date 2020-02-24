@@ -140,11 +140,11 @@ ErrorIfUnsupportedAlterRoleSetStmt(AlterRoleSetStmt *stmt)
 	if (setStmt->kind == VAR_SET_CURRENT)
 	{
 		/* check if the set action is a SET ... FROM CURRENT */
-		ereport(ERROR, (errmsg("unsupported ALTER ROLE ... SET ... FROM "
-							   "CURRENT for a distributed role"),
-						errhint("SET FROM CURRENT is not supported for "
-								"distributed users, instead use the SET ... "
-								"TO ... syntax with a constant value.")));
+		ereport(WARNING, (errmsg("not propagating ALTER ROLE .. SET .. FROM"
+								 " CURRENT command to worker nodes"),
+						  errhint("SET FROM CURRENT is not supported for "
+								  "distributed users, instead use the SET ... "
+								  "TO ... syntax with a constant value.")));
 	}
 }
 
