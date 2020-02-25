@@ -813,18 +813,18 @@ ExecuteUtilityTaskListWithoutResults(List *taskList, bool localExecutionSupporte
 	List *localTaskList = NIL;
 	List *remoteTaskList = NIL;
 
-	bool readOnlyPlan = !TaskListModifiesDatabase(rowModifyLevel, taskList);
-
-	/* divide tasks into two if localExecutionSupported is set to true */
-	if (localExecutionSupported)
+	/*
+	 * Divide tasks into two if localExecutionSupported is set to true and execute
+	 * the local tasks
+	 */
+	if (localExecutionSupported && ShouldExecuteTasksLocally(taskList))
 	{
+		bool readOnlyPlan = !TaskListModifiesDatabase(rowModifyLevel, taskList);
+
 		/* set local (if any) & remote tasks */
 		ExtractLocalAndRemoteTasks(readOnlyPlan, taskList, &localTaskList,
 								   &remoteTaskList);
-	}
 
-	if (ShouldExecuteTasksLocally(localTaskList))
-	{
 		/* execute local tasks */
 		ExecuteLocalUtilityTaskList(localTaskList);
 	}
@@ -922,7 +922,7 @@ ExecuteTaskListExtended(RowModifyLevel modLevel, List *taskList,
 	 * then we should error out as it would cause inconsistencies accross the
 	 * remote connection and local execution
 	 */
-	ErrorIfTransactionAndAnyTaskAccessedPlacementsLocally(taskList);
+	ErrorIfRemoteTaskExecutionOnLocallyAccessedPlacements(taskList);
 
 	if (MultiShardConnectionType == SEQUENTIAL_CONNECTION)
 	{
